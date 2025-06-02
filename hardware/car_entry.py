@@ -5,8 +5,7 @@ import pytesseract
 import os
 import time
 import serial
-import serial.tools.list_ports
-import csv
+import sqlite3
 from collections import Counter
 from datetime import datetime
 
@@ -15,35 +14,44 @@ model = YOLO('../model_dev/runs/detect/train/weights/best.pt')
 
 # Configurations
 SAVE_DIR = 'plates'
-CSV_FILE = 'db.csv'
-VIOLATION_FILE = 'violations.csv'
+DB_FILE = 'parking.db'
 ENTRY_COOLDOWN = 300  # seconds
-MAX_DISTANCE = 50     # cm
+MAX_DISTANCE = 20     # cm
 MIN_DISTANCE = 0      # cm
-CAPTURE_THRESHOLD = 3 # number of consistent reads before logging
-GATE_OPEN_TIME = 15   # seconds
+CAPTURE_THRESHOLD = 6 # number of consistent reads before logging
+GATE_OPEN_TIME = 10   # seconds
 
-# Ensure directories and CSV exist
+# Ensure plates directory exists
 os.makedirs(SAVE_DIR, exist_ok=True)
-if not os.path.exists(CSV_FILE):
-    with open(CSV_FILE, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(['no', 'entry_time', 'exit_time', 'car_plate', 'due payment', 'payment status'])
 
-# Log violation to violations.csv
+# SQLite connection (single instance)
+conn = sqlite3.connect(DB_FILE)
+conn.row_factory = sqlite3.Row
+cursor = conn.cursor()
+
+# Log violation to violations table
 def log_violation(plate_number, gate_location, reason):
-    file_exists = os.path.isfile(VIOLATION_FILE)
-    with open(VIOLATION_FILE, 'a', newline='') as file:
-        writer = csv.DictWriter(file, fieldnames=['timestamp', 'car_plate', 'gate_location', 'reason'])
-        if not file_exists:
-            writer.writeheader()
-        writer.writerow({
-            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-            'car_plate': plate_number,
-            'gate_location': gate_location,
-            'reason': reason
-        })
+    cursor.execute('''
+        INSERT INTO violations (timestamp, car_plate, gate_location, reason)
+        VALUES (?, ?, ?, ?)
+    ''', (
+        datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        plate_number,
+        gate_location,
+        reason
+    ))
+    conn.commit()
     print(f"[LOGGED] Violation for {plate_number} at {gate_location}: {reason}")
+
+# Check for existing unpaid entry in database
+def has_unpaid_record(plate):
+    cursor.execute('SELECT 1 FROM entries WHERE car_plate = ? AND payment_status = 0', (plate,))
+    return cursor.fetchone() is not None
+
+# Get next entry number
+def get_next_entry_no():
+    cursor.execute('SELECT COALESCE(MAX(no), 0) + 1 AS next_no FROM entries')
+    return cursor.fetchone()['next_no']
 
 # Auto-detect Arduino Serial Port
 def detect_arduino_port():
@@ -67,14 +75,15 @@ def read_distance(arduino):
     except (UnicodeDecodeError, ValueError):
         return None
 
-# Check for existing unpaid entry in CSV
-def has_unpaid_record(plate):
-    with open(CSV_FILE, 'r', newline='') as f:
-        reader = csv.reader(f)
-        next(reader, None)  # skip header
-        for row in reader:
-            if row[3] == plate and row[5] == '0':
+# Wait for Arduino response
+def wait_for_arduino_response(arduino, expected, timeout=2.0):
+    start_time = time.time()
+    while time.time() - start_time < timeout:
+        if arduino.in_waiting:
+            response = arduino.readline().decode('utf-8').strip()
+            if expected in response:
                 return True
+        time.sleep(0.01)
     return False
 
 # Initialize Arduino
@@ -82,8 +91,9 @@ arduino_port = detect_arduino_port()
 arduino = None
 if arduino_port:
     print(f"[CONNECTED] Arduino on {arduino_port}")
-    arduino = serial.Serial(arduino_port, 9600, timeout=1)
+    arduino = serial.Serial(arduino_port, 115200, timeout=1)  # Increased baud rate
     time.sleep(2)
+    arduino.flush()  # Clear serial buffer
 else:
     print("[ERROR] Arduino not detected.")
 
@@ -101,7 +111,8 @@ cv2.resizeWindow('Webcam Feed', 800, 600)
 plate_buffer = []
 last_saved_plate = None
 last_entry_time = 0
-entry_count = sum(1 for _ in open(CSV_FILE)) - 1
+gate_open_until = 0
+gate_is_open = False
 
 print("[SYSTEM] Ready. Press 'q' to exit.")
 
@@ -115,6 +126,16 @@ try:
         # Get distance reading, default to safe value
         distance = read_distance(arduino) or (MAX_DISTANCE - 1)
         annotated = frame.copy()
+
+        # Handle gate closing
+        current_time = time.time()
+        if gate_is_open and current_time >= gate_open_until:
+            if arduino:
+                arduino.flush()
+                arduino.write(b'0')
+                if wait_for_arduino_response(arduino, "[GATE] Closed"):
+                    print("[GATE] Closing gate (sent '0')")
+                gate_is_open = False
 
         if MIN_DISTANCE <= distance <= MAX_DISTANCE:
             results = model(frame)[0]
@@ -144,7 +165,7 @@ try:
                         plate_buffer.append(plate)
 
                 # Once buffer is full, decide
-                if len(plate_buffer) >= CAPTURE_THRESHOLD:
+                if len(plate_buffer) >= CAPTURE_THRESHOLD and not gate_is_open:
                     common = Counter(plate_buffer).most_common(1)[0][0]
                     now = time.time()
 
@@ -155,23 +176,29 @@ try:
                     else:
                         # Apply cooldown logic
                         if common != last_saved_plate or (now - last_entry_time) > ENTRY_COOLDOWN:
-                            with open(CSV_FILE, 'a', newline='') as f:
-                                writer = csv.writer(f)
-                                entry_count += 1
-                                writer.writerow([
-                                    entry_count,
-                                    time.strftime('%Y-%m-%d %H:%M:%S'),
-                                    '', common, '', '0'
-                                ])
+                            entry_count = get_next_entry_no()
+                            cursor.execute('''
+                                INSERT INTO entries (no, entry_time, exit_time, car_plate, due_payment, payment_status)
+                                VALUES (?, ?, ?, ?, ?, ?)
+                            ''', (
+                                entry_count,
+                                time.strftime('%Y-%m-%d %H:%M:%S'),
+                                '',
+                                common,
+                                None,
+                                0
+                            ))
+                            conn.commit()
                             print(f"[NEW] Logged plate {common}")
 
                             # Gate actuation
                             if arduino:
+                                arduino.flush()
                                 arduino.write(b'1')
-                                print("[GATE] Opening gate (sent '1')")
-                                time.sleep(GATE_OPEN_TIME)
-                                arduino.write(b'0')
-                                print("[GATE] Closing gate (sent '0')")
+                                if wait_for_arduino_response(arduino, "[GATE] Opened"):
+                                    print("[GATE] Opening gate (sent '1')")
+                                gate_open_until = time.time() + GATE_OPEN_TIME
+                                gate_is_open = True
 
                             last_saved_plate = common
                             last_entry_time = now
@@ -183,7 +210,6 @@ try:
                 # Show previews
                 cv2.imshow('Plate', plate_img)
                 cv2.imshow('Processed', thresh)
-                time.sleep(0.5)
 
         # Display feed
         cv2.imshow('Webcam Feed', annotated)
@@ -192,5 +218,9 @@ try:
 finally:
     cap.release()
     if arduino:
+        if gate_is_open:
+            arduino.write(b'0')
+            time.sleep(0.1)
         arduino.close()
+    conn.close()
     cv2.destroyAllWindows()

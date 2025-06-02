@@ -1,167 +1,159 @@
-#include <Servo.h>
+#include <SPI.h>
+#include <MFRC522.h>
 
-// Pin Definitions
-#define TRIGGER_PIN 2
-#define ECHO_PIN 3
-#define RED_LED_PIN 4
-#define BLUE_LED_PIN 5
-#define SERVO_PIN 6
-#define GND_PIN_1 7
-#define GND_PIN_2 8
-#define BUZZER_PIN 12  // Corrected from 11 to 12
+#define RST_PIN 9
+#define SS_PIN 10
 
-// System State
-bool gateOpen = false;
-unsigned long lastBuzzTime = 0;
-const unsigned long buzzInterval = 300;
-bool buzzerState = false;
-bool alertActive = false;
-Servo barrierServo;
+MFRC522 mfrc522(SS_PIN, RST_PIN);
+MFRC522::MIFARE_Key key;
+MFRC522::StatusCode card_status;
 
-// ================== INITIALIZATION ==================
-void initializeSerial() {
-  Serial.begin(9600);
-}
+bool awaitingUpdate = false;
+bool sentReady = false;
+String currentPlate = "";
+long currentBalance = 0;
 
-void initializeUltrasonic() {
-  pinMode(TRIGGER_PIN, OUTPUT);
-  pinMode(ECHO_PIN, INPUT);
-}
+// Timeout variables
+unsigned long readySentTime = 0;
+const unsigned long RESPONSE_TIMEOUT = 10000; // 10 seconds
 
-void initializeLEDs() {
-  pinMode(RED_LED_PIN, OUTPUT);
-  pinMode(BLUE_LED_PIN, OUTPUT);
-}
-
-void initializeBuzzer() {
-  pinMode(BUZZER_PIN, OUTPUT);
-  digitalWrite(BUZZER_PIN, LOW);
-}
-
-void initializeHardcodedGrounds() {
-  pinMode(GND_PIN_1, OUTPUT);
-  pinMode(GND_PIN_2, OUTPUT);
-  digitalWrite(GND_PIN_1, LOW);
-  digitalWrite(GND_PIN_2, LOW);
-}
-
-void initializeServo() {
-  barrierServo.attach(SERVO_PIN);
-  setGatePosition(6); // Start with closed gate
-}
-
-// ================== CORE FUNCTIONS ==================
-float measureDistance() {
-  digitalWrite(TRIGGER_PIN, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIGGER_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIGGER_PIN, LOW);
-  long duration = pulseIn(ECHO_PIN, HIGH);
-  return (duration * 0.0343) / 2.0;
-}
-
-void setGatePosition(int angle) {
-  barrierServo.write(angle);
-}
-
-// ================== GATE CONTROL ==================
-void openGate() {
-  if (alertActive) return; // Prevent opening during alerts
-  setGatePosition(90);
-  gateOpen = true;
-  digitalWrite(BLUE_LED_PIN, HIGH);
-  digitalWrite(RED_LED_PIN, LOW);
-  Serial.println("[GATE] Opened");
-}
-
-void closeGate() {
-  setGatePosition(6);
-  gateOpen = false;
-  digitalWrite(BLUE_LED_PIN, LOW);
-  digitalWrite(RED_LED_PIN, HIGH);
-  Serial.println("[GATE] Closed");
-}
-
-// ================== ALERT SYSTEM ==================
-void triggerAlert() {
-  alertActive = true;
-  digitalWrite(BUZZER_PIN, HIGH); // Turn buzzer on
-  // LEDs reflect gate state, not alert
-  digitalWrite(RED_LED_PIN, gateOpen ? LOW : HIGH);
-  digitalWrite(BLUE_LED_PIN, gateOpen ? HIGH : LOW);
-  Serial.println("[ALERT] Unpaid vehicle detected!");
-}
-
-void stopAlert() {
-  alertActive = false;
-  digitalWrite(BUZZER_PIN, LOW); // Turn buzzer off
-  // LEDs reflect gate state
-  digitalWrite(RED_LED_PIN, gateOpen ? LOW : HIGH);
-  digitalWrite(BLUE_LED_PIN, gateOpen ? HIGH : LOW);
-  Serial.println("[ALERT] Cleared");
-}
-
-// ================== COMMAND HANDLER ==================
-void handleSerialCommands() {
-  if (Serial.available()) {
-    char cmd = Serial.read();
-    switch(cmd) {
-      case '1': // Open gate
-        openGate();
-        break;
-      case '0': // Close gate or stop alert
-        if (alertActive) {
-          stopAlert();
-        } else {
-          closeGate();
-        }
-        break;
-      case '2': // Trigger alert
-        triggerAlert();
-        break;
-      default:
-        Serial.println("[ERROR] Unknown command");
-    }
-  }
-}
-
-// ================== BUZZER CONTROL ==================
-void handleBuzzer() {
-  if (gateOpen && !alertActive) {
-    unsigned long currentMillis = millis();
-    if (currentMillis - lastBuzzTime >= buzzInterval) {
-      buzzerState = !buzzerState;
-      digitalWrite(BUZZER_PIN, buzzerState);
-      lastBuzzTime = currentMillis;
-    }
-  } else if (!alertActive) {
-    digitalWrite(BUZZER_PIN, LOW); // Ensure buzzer is off when gate is closed
-  }
-}
-
-// ================== MAIN LOOP ==================
 void setup() {
-  initializeSerial();
-  initializeUltrasonic();
-  initializeLEDs();
-  initializeBuzzer();
-  initializeHardcodedGrounds();
-  initializeServo();
-  // Initial state
-  digitalWrite(RED_LED_PIN, HIGH); // Closed gate indicator
-  digitalWrite(BLUE_LED_PIN, LOW);
-  Serial.println("[SYSTEM] Ready");
+    Serial.begin(9600);
+    SPI.begin();
+    mfrc522.PCD_Init();
+
+    for (byte i = 0; i < 6; i++) {
+        key.keyByte[i] = 0xFF;
+    }
+
+    Serial.println(F("==== PAYMENT MODE RFID ===="));
+    Serial.println(F("Place your card near the reader..."));
 }
 
 void loop() {
-  // 1. Sensor monitoring
-  float distance = measureDistance();
-  Serial.print("[DISTANCE] ");
-  Serial.println(distance);
-  // 2. Command handling
-  handleSerialCommands();
-  // 3. Buzzer management
-  handleBuzzer();
-  delay(50); // Main loop delay
+    if (!awaitingUpdate) {
+        if (!mfrc522.PICC_IsNewCardPresent() || !mfrc522.PICC_ReadCardSerial()) return;
+
+        currentPlate = readBlockData(2, "Car Plate");
+        String balanceStr = readBlockData(4, "Balance");
+
+        // Validate data before proceeding
+        if (currentPlate.startsWith("[") || balanceStr.startsWith("[")) {
+            Serial.println(F("⚠️ Invalid card data. Try again."));
+            mfrc522.PICC_HaltA();
+            mfrc522.PCD_StopCrypto1();
+            delay(2000);
+            return;
+        }
+
+        currentBalance = balanceStr.toInt();
+        Serial.print(currentPlate);
+        Serial.print(",");
+        Serial.println(balanceStr);
+
+        awaitingUpdate = true;
+        sentReady = false;
+    }
+
+    if (awaitingUpdate && !sentReady) {
+        Serial.println("READY");
+        sentReady = true;
+        readySentTime = millis();  // Start the timeout
+    }
+
+    if (awaitingUpdate && sentReady) {
+        // Timeout handling
+        if (millis() - readySentTime > RESPONSE_TIMEOUT) {
+            Serial.println("[TIMEOUT] No response from PC. Resetting.");
+            awaitingUpdate = false;
+            sentReady = false;
+            mfrc522.PICC_HaltA();
+            mfrc522.PCD_StopCrypto1();
+            delay(1000);
+            return;
+        }
+
+        if (Serial.available()) {
+            String response = Serial.readStringUntil('\n');
+            response.trim();
+
+            Serial.print("[RECEIVED FROM PC]: ");
+            Serial.println(response);
+
+            if (response == "I") {
+                Serial.println("[DENIED] Insufficient balance");
+            } else {
+                Serial.print("[DEBUG] Cleaned response: '");
+                Serial.print(response);
+                Serial.println("'");
+
+                response.trim();  // Right before toInt()
+                long newBalance = response.toInt();
+                Serial.print(newBalance);
+
+
+
+                if (newBalance >= 0) {
+                    Serial.println("[WRITING] New balance to card...");
+                    writeBlockData(4, String(newBalance));
+                    Serial.println("DONE");
+                    Serial.print("[UPDATED] New Balance: ");
+                    Serial.println(newBalance);
+                } else {
+                    Serial.println("[ERROR] Invalid new balance received.");
+                }
+            }
+
+            awaitingUpdate = false;
+            sentReady = false;
+
+            mfrc522.PICC_HaltA();
+            mfrc522.PCD_StopCrypto1();
+            delay(2000);
+        }
+    }
+}
+
+String readBlockData(byte blockNumber, String label){
+    byte buffer[18];
+    byte bufferSize = sizeof(buffer);
+
+    card_status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, blockNumber, &key, &(mfrc522.uid));
+    if (card_status != MFRC522::STATUS_OK) {
+        Serial.print("❌ Auth failed for ");
+        Serial.println(label);
+        return "[Auth Fail]";
+    }
+
+    card_status = mfrc522.MIFARE_Read(blockNumber, buffer, &bufferSize);
+    if (card_status != MFRC522::STATUS_OK) {
+        Serial.print("❌ Read failed for ");
+        Serial.println(label);
+        return "[Read Fail]";
+    }
+
+    String data = "";
+    for (uint8_t i = 0; i < 16; i++) {
+        data += (char)buffer[i];
+    }
+    data.trim();
+    return data;
+}
+
+void writeBlockData(byte blockNumber, String data) {
+    byte buffer[16];
+    data.trim();
+    while (data.length() < 16) data += ' ';
+    data.substring(0, 16).getBytes(buffer, 16);
+
+    card_status = mfrc522.PCD_Authenticate(MFRC522::PICC_CMD_MF_AUTH_KEY_A, blockNumber, &key, &(mfrc522.uid));
+    if (card_status != MFRC522::STATUS_OK) {
+        Serial.println("❌ Auth failed on write");
+        return;
+    }
+
+    card_status = mfrc522.MIFARE_Write(blockNumber, buffer, 16);
+    if (card_status != MFRC522::STATUS_OK) {
+        Serial.println("❌ Write failed");
+    }
 }
